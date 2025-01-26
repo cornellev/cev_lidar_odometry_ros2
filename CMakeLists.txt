@@ -20,7 +20,7 @@ add_executable(lidar_odometry src/lidar_odometry.cpp)
 target_include_directories(lidar_odometry PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-target_link_libraries(lidar_odometry cevicp Eigen3::Eigen)
+target_link_libraries(lidar_odometry CevIcp::cevicp Eigen3::Eigen)
 target_compile_features(lidar_odometry PUBLIC c_std_11 cxx_std_17)  # Require C99 and C++17
 
 ament_target_dependencies(lidar_odometry rclcpp sensor_msgs nav_msgs tf2 tf2_eigen)
