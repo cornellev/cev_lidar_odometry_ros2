@@ -1,11 +1,9 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.11)
 project(lidar_odometry)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
-
-option(USE_SUBMODULE "Use the submoduled libcevicp instead of the installed one" ON)
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
@@ -16,6 +14,7 @@ find_package(nav_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
+find_package(CevIcp REQUIRED)
 
 add_executable(lidar_odometry src/lidar_odometry.cpp)
 target_include_directories(lidar_odometry PUBLIC

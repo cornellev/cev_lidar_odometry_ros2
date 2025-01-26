@@ -93,8 +93,6 @@ private:
 };
 
 int main(int argc, char* argv[]) {
-    icp::ICP::register_builtin_methods();
-
     rclcpp::init(argc, argv);
     rclcpp::spin(std::make_shared<LidarOdometry>());
     rclcpp::shutdown();
