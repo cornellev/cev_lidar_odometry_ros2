@@ -11,28 +11,57 @@
 #include "tf2_eigen/tf2_eigen.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
+#include <chrono>
 
 class LidarOdometry : public rclcpp::Node {
 public:
-    LidarOdometry(): Node("lidar_odometry"), driver_(driver_init()) {
+    LidarOdometry(): Node("lidar_odometry"), driver(driver_init()) {
         this->declare_parameter("odom_frame", "odom");
 
-        sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>("scan",
+        scan_sub = this->create_subscription<sensor_msgs::msg::LaserScan>("scan",
             rclcpp::SensorDataQoS(),
             std::bind(&LidarOdometry::scan_callback, this, std::placeholders::_1));
 
-        pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", rclcpp::QoS(1));
-        prev_scan_pub_ = this->create_publisher<sensor_msgs::msg::LaserScan>("prev_scan",
-            rclcpp::QoS(1));
-        transformed_scan_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "transformed_scan", rclcpp::QoS(1));
+        odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("odom", rclcpp::QoS(1));
 
-        tf_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+        // TODO: make false
+        if (this->declare_parameter("show_debug_scans", true)) {
+            DebugPublishers publishers;
+
+            publishers.base_scan =
+                this->create_publisher<sensor_msgs::msg::PointCloud2>("base_scan", rclcpp::QoS(1));
+            publishers.transformed_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+                "transformed_scan", rclcpp::QoS(1));
+            publishers.current_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+                "current_scan", rclcpp::QoS(1));
+
+            debug_publishers = publishers;
+        }
+
+        // TODO: make false
+        if (this->declare_parameter("publish_tf", true)) {
+            tf = tf2_ros::TransformBroadcaster(this);
+        }
+
+        this->declare_parameter("rebase_translation_min_cm", 0.1);
+        this->declare_parameter("rebase_angle_min_rad", 5 * M_PI / 180);
+        this->declare_parameter("rebase_time_min_ms", 1000);
     }
 
 private:
+    struct DebugPublishers {
+        rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr base_scan;
+        rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr current_scan;
+        rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr transformed_scan;
+    };
+
+    struct BaseScanInfo {
+        sensor_msgs::msg::LaserScan::SharedPtr base_scan;
+        std::vector<icp::Vector> points;
+    };
+
     icp::ICPDriver driver_init() {
-        auto method = this->declare_parameter("icp_method", "feature_aware");
+        auto method = this->declare_parameter("icp_method", "trimmed");
 
         // TODO: load from params
         icp::ICP::Config config;
@@ -44,50 +73,52 @@ private:
 
         icp::ICPDriver driver(std::move(icp_opt.value()));
 
+        // TODO: parameterize
         // driver.set_transform_tolerance(1 * M_PI / 180, 0.01);  // 1 degree, 1 cm
-        driver.set_max_iterations(10);
+        driver.set_max_iterations(30);
 
         return driver;
     }
 
     void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr scan) {
         auto points = get_points(scan);
-        if (prev_points_.empty()) {
-            prev_points_ = points;
-            prev_scan_ = scan;
+
+        if (!base_info.has_value()) {
+            BaseScanInfo info;
+            info.base_scan = scan;
+            info.points = points;
+
+            base_info = info;
             return;
         }
 
-        auto result = driver_.converge(prev_points_, points, icp::RBTransform());
+        // TODO: maybe add an inverse function so we don't have to swap the order
+        auto result = driver.converge(points, base_info->points, icp::RBTransform());
 
         Eigen::Rotation2Dd result_rot(result.transform.rotation);
 
-        if (result.transform.translation.norm() > 0.05
-            || std::abs(result_rot.angle()) > 2 * M_PI / 180) {
-            current_transform_ = current_transform_.and_then(result.transform);
-            prev_points_ = points;
-            prev_scan_ = scan;
-        }
-
-        std::cout << result.transform.rotation << std::endl;
-
-        RCLCPP_INFO(this->get_logger(), "dx: %f, dy: %f, x: %f, y: %f, iter: %zu, angle: %f",
+        RCLCPP_DEBUG(this->get_logger(), "dx: %f, dy: %f, dtheta: %f",
             result.transform.translation.x(), result.transform.translation.y(),
-            current_transform_.translation.x(), current_transform_.translation.y(),
-            result.iteration_count, result_rot.angle());
+            result_rot.smallestAngle());
+        Eigen::Rotation2Dd final_rot(current_transform.rotation);
+        RCLCPP_DEBUG(this->get_logger(), "x: %f, y: %f, theta: %f",
+            current_transform.translation.x(), current_transform.translation.y(),
+            final_rot.smallestAngle());
 
         auto odom = nav_msgs::msg::Odometry();
         odom.header.stamp = scan->header.stamp;
         odom.header.frame_id = this->get_parameter("odom_frame").as_string();
         odom.child_frame_id = scan->header.frame_id;
 
-        odom.pose.pose.position = tf2::toMsg(Eigen::Vector3d(current_transform_.translation.x(),
-            current_transform_.translation.y(), 0));
+        odom.pose.pose.position = tf2::toMsg(Eigen::Vector3d(current_transform.translation.x(),
+            current_transform.translation.y(), 0));
 
-        Eigen::Rotation2Dd rot(current_transform_.rotation);
-        Eigen::AngleAxisd angle_axis(rot.angle(), Eigen::Vector3d::UnitZ());
+        Eigen::Rotation2Dd rot(current_transform.rotation);
+        Eigen::AngleAxisd angle_axis(rot.smallestAngle(), Eigen::Vector3d::UnitZ());
         Eigen::Quaterniond quat(angle_axis);
         odom.pose.pose.orientation = tf2::toMsg(quat);
+
+        odom_pub->publish(odom);
 
         geometry_msgs::msg::TransformStamped t;
         t.header = odom.header;
@@ -97,21 +128,49 @@ private:
         t.transform.translation.z = odom.pose.pose.position.z;
         t.transform.rotation = odom.pose.pose.orientation;
 
-        tf_->sendTransform(t);
-
-        prev_scan_->header.stamp = scan->header.stamp;
-        prev_scan_pub_->publish(*prev_scan_);
-
-        // Create a PointCloud2 message
-        std::vector<icp::Vector> transformed_points(points.size());
-        for (std::size_t i = 0; i < points.size(); i++) {
-            transformed_points[i] = result.transform.apply_to(prev_points_[i]);
+        if (tf.has_value()) {
+            tf->sendTransform(t);
         }
 
-        auto cloud = create_pointcloud(transformed_points, scan->header);
-        transformed_scan_pub_->publish(cloud);
+        if (debug_publishers.has_value()) {
+            debug_publishers->base_scan->publish(create_pointcloud(base_info->points,
+                base_info->base_scan->header));
 
-        pub_->publish(odom);
+            std::vector<icp::Vector> transformed_points(points.size());
+            for (std::size_t i = 0; i < points.size(); i++) {
+                transformed_points[i] = result.transform.apply_to(base_info->points[i]);
+            }
+
+            auto cloud = create_pointcloud(transformed_points, scan->header);
+            debug_publishers->transformed_scan->publish(cloud);
+
+            auto current_cloud = create_pointcloud(points, scan->header);
+            debug_publishers->current_scan->publish(current_cloud);
+        }
+
+        // update base scan
+        rclcpp::Time last_scan_time(base_info->base_scan->header.stamp);
+        auto rebase_ms =
+            std::chrono::milliseconds(this->get_parameter("rebase_time_min_ms").as_int());
+
+        bool conditions[3] = {
+            result.transform.translation.norm()
+                > this->get_parameter("rebase_translation_min_cm").as_double(),
+            std::abs(result_rot.smallestAngle())
+                > this->get_parameter("rebase_angle_min_rad").as_double(),
+            this->get_clock()->now() - last_scan_time > rclcpp::Duration(rebase_ms),
+        };
+
+        if (conditions[0] || conditions[1] || conditions[2]) {
+            current_transform = current_transform.and_then(result.transform);
+
+            base_info->base_scan = scan;
+            base_info->points = points;
+
+            RCLCPP_DEBUG(this->get_logger(),
+                "Rebasing scan. Reasons: translation: %d, rotation: %d, time: %d", conditions[0],
+                conditions[1], conditions[2]);
+        }
     }
 
     std::vector<icp::Vector> get_points(const sensor_msgs::msg::LaserScan::SharedPtr scan) {
@@ -163,16 +222,16 @@ private:
         return cloud;
     }
 
-    icp::ICPDriver driver_;
-    icp::RBTransform current_transform_;
-    std::vector<icp::Vector> prev_points_;
-    sensor_msgs::msg::LaserScan::SharedPtr prev_scan_;
+    icp::ICPDriver driver;
+    icp::RBTransform current_transform;
+    std::optional<BaseScanInfo> base_info;
 
-    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub_;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_;
-    rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr prev_scan_pub_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr transformed_scan_pub_;
-    std::shared_ptr<tf2_ros::TransformBroadcaster> tf_;
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
+
+    std::optional<DebugPublishers> debug_publishers;
+
+    std::optional<tf2_ros::TransformBroadcaster> tf;
 };
 
 int main(int argc, char* argv[]) {
