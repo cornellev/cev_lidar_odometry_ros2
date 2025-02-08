@@ -43,8 +43,8 @@ public:
             tf = tf2_ros::TransformBroadcaster(this);
         }
 
-        this->declare_parameter("rebase_translation_min_cm", 0.1);
-        this->declare_parameter("rebase_angle_min_rad", 5 * M_PI / 180);
+        this->declare_parameter("rebase_translation_min_m", 0.05);        // 5 cm
+        this->declare_parameter("rebase_angle_min_rad", 2 * M_PI / 180);  // 2 deg
         this->declare_parameter("rebase_time_min_ms", 1000);
     }
 
@@ -61,7 +61,7 @@ private:
     };
 
     icp::ICPDriver driver_init() {
-        auto method = this->declare_parameter("icp_method", "trimmed");
+        auto method = this->declare_parameter("icp_method", "feature_aware");
 
         // TODO: load from params
         icp::ICP::Config config;
@@ -74,8 +74,8 @@ private:
         icp::ICPDriver driver(std::move(icp_opt.value()));
 
         // TODO: parameterize
-        // driver.set_transform_tolerance(1 * M_PI / 180, 0.01);  // 1 degree, 1 cm
-        driver.set_max_iterations(30);
+        driver.set_transform_tolerance(0.1 * M_PI / 180, 0.005);  // 0.1 degree, 5 mm
+        driver.set_max_iterations(10);
 
         return driver;
     }
@@ -92,19 +92,62 @@ private:
             return;
         }
 
-        // TODO: maybe add an inverse function so we don't have to swap the order
         auto result = driver.converge(points, base_info->points, icp::RBTransform());
 
         Eigen::Rotation2Dd result_rot(result.transform.rotation);
+        RCLCPP_DEBUG(this->get_logger(), "dx: %f, dy: %f, dtheta: %f, iterations: %zu",
+            result.transform.translation.x(), result.transform.translation.y(), result_rot.angle(),
+            result.iteration_count);
 
-        RCLCPP_DEBUG(this->get_logger(), "dx: %f, dy: %f, dtheta: %f",
-            result.transform.translation.x(), result.transform.translation.y(),
-            result_rot.smallestAngle());
+        // publish debug scans (important that this happens before we update base scans)
+        if (debug_publishers.has_value()) {
+            auto point_transform = result.transform.inverse();
+
+            debug_publishers->base_scan->publish(create_pointcloud(base_info->points,
+                base_info->base_scan->header));
+
+            std::vector<icp::Vector> transformed_points(points.size());
+            for (std::size_t i = 0; i < points.size(); i++) {
+                transformed_points[i] = point_transform.apply_to(base_info->points[i]);
+            }
+
+            auto cloud = create_pointcloud(transformed_points, scan->header);
+            debug_publishers->transformed_scan->publish(cloud);
+
+            auto current_cloud = create_pointcloud(points, scan->header);
+            debug_publishers->current_scan->publish(current_cloud);
+        }
+
+        // update base scan
+        rclcpp::Time last_scan_time(base_info->base_scan->header.stamp);
+        auto rebase_ms =
+            std::chrono::milliseconds(this->get_parameter("rebase_time_min_ms").as_int());
+
+        bool conditions[3] = {
+            result.transform.translation.norm()
+                > this->get_parameter("rebase_translation_min_m").as_double(),
+            std::abs(result_rot.smallestAngle())
+                > this->get_parameter("rebase_angle_min_rad").as_double(),
+            this->get_clock()->now() - last_scan_time > rclcpp::Duration(rebase_ms),
+        };
+
+        if (conditions[0] || conditions[1]) {
+            current_transform = current_transform.and_then(result.transform);
+
+            base_info->base_scan = scan;
+            base_info->points = points;
+
+            RCLCPP_DEBUG(this->get_logger(),
+                "Rebasing scan. Reasons: translation: %d, rotation: %d, time: %d", conditions[0],
+                conditions[1], conditions[2]);
+        }
+
         Eigen::Rotation2Dd final_rot(current_transform.rotation);
         RCLCPP_DEBUG(this->get_logger(), "x: %f, y: %f, theta: %f",
             current_transform.translation.x(), current_transform.translation.y(),
             final_rot.smallestAngle());
 
+        // publish odometry and tf
         auto odom = nav_msgs::msg::Odometry();
         odom.header.stamp = scan->header.stamp;
         odom.header.frame_id = this->get_parameter("odom_frame").as_string();
@@ -130,46 +173,6 @@ private:
 
         if (tf.has_value()) {
             tf->sendTransform(t);
-        }
-
-        if (debug_publishers.has_value()) {
-            debug_publishers->base_scan->publish(create_pointcloud(base_info->points,
-                base_info->base_scan->header));
-
-            std::vector<icp::Vector> transformed_points(points.size());
-            for (std::size_t i = 0; i < points.size(); i++) {
-                transformed_points[i] = result.transform.apply_to(base_info->points[i]);
-            }
-
-            auto cloud = create_pointcloud(transformed_points, scan->header);
-            debug_publishers->transformed_scan->publish(cloud);
-
-            auto current_cloud = create_pointcloud(points, scan->header);
-            debug_publishers->current_scan->publish(current_cloud);
-        }
-
-        // update base scan
-        rclcpp::Time last_scan_time(base_info->base_scan->header.stamp);
-        auto rebase_ms =
-            std::chrono::milliseconds(this->get_parameter("rebase_time_min_ms").as_int());
-
-        bool conditions[3] = {
-            result.transform.translation.norm()
-                > this->get_parameter("rebase_translation_min_cm").as_double(),
-            std::abs(result_rot.smallestAngle())
-                > this->get_parameter("rebase_angle_min_rad").as_double(),
-            this->get_clock()->now() - last_scan_time > rclcpp::Duration(rebase_ms),
-        };
-
-        if (conditions[0] || conditions[1] || conditions[2]) {
-            current_transform = current_transform.and_then(result.transform);
-
-            base_info->base_scan = scan;
-            base_info->points = points;
-
-            RCLCPP_DEBUG(this->get_logger(),
-                "Rebasing scan. Reasons: translation: %d, rotation: %d, time: %d", conditions[0],
-                conditions[1], conditions[2]);
         }
     }
 
