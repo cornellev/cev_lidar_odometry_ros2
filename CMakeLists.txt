@@ -19,7 +19,6 @@ find_package(tf2_eigen REQUIRED)
 
 if(USE_SUBMODULE)
   option(LIB_ONLY "" ON)
-  message("Hi")
   add_subdirectory(icp)
 else()
   find_package(CevIcp REQUIRED)
