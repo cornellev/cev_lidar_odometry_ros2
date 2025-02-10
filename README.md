@@ -1,9 +1,11 @@
 # lidar_odometry
-
 Package to produce odometry from (2D) LiDAR data. Uses [libcevicp](https://github.com/cornellev/icp).
 
 ## Building
-You must install the CEV ICP library from commit [a02c13c](https://github.com/cornellev/icp/tree/a02c13c6020af7405ed7c820112746184f381a0a). You'll probably have the best time if you use the default install directory. There are ROS 2 dependencies as well, but `rosdep` should help you with those.
+There are ROS 2 dependencies, but `rosdep` should help you with those. As long as you clone with `--recursive`, the submoduled `libcevicp` is used automatically.
+
+## Developing
+You will likely want to develop `libcevicp` in parallel. If you want, you can use the installed version by turning off the `USE_SUBMODULE` cmake option. You can also develop from within the submodule.
 
 ## Parameters
 * `odom_frame` - The name of the odometry frame to publish odom info with.
