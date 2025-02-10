@@ -5,6 +5,8 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+option(USE_SUBMODULE "Use the submoduled libicp instead of the installed version" ON)
+
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(Eigen3 REQUIRED)
@@ -14,13 +16,20 @@ find_package(nav_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
-find_package(CevIcp REQUIRED)
+
+if(USE_SUBMODULE)
+  option(LIB_ONLY "" ON)
+  message("Hi")
+  add_subdirectory(icp)
+else()
+  find_package(CevIcp REQUIRED)
+endif()
 
 add_executable(lidar_odometry src/lidar_odometry.cpp)
 target_include_directories(lidar_odometry PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-target_link_libraries(lidar_odometry CevIcp::cevicp Eigen3::Eigen)
+target_link_libraries(lidar_odometry cevicp Eigen3::Eigen)
 target_compile_features(lidar_odometry PUBLIC c_std_11 cxx_std_17)  # Require C99 and C++17
 
 ament_target_dependencies(lidar_odometry rclcpp sensor_msgs nav_msgs tf2 tf2_eigen)
