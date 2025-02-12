@@ -37,7 +37,7 @@ ament_target_dependencies(lidar_odometry rclcpp sensor_msgs nav_msgs tf2 tf2_eig
 install(TARGETS lidar_odometry
   DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY launch config
+install(DIRECTORY launch
     DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)

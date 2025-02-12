@@ -23,19 +23,22 @@ public:
 
         odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("odom", rclcpp::QoS(1));
 
-        scan_sub.subscribe(this, "scan", rclcpp::SensorDataQoS().get_rmw_qos_profile());
+        auto sensor_qos = rclcpp::SensorDataQoS();
+        scan_sub.subscribe(this, "scan", sensor_qos.get_rmw_qos_profile());
 
         using std::placeholders::_1;
         using std::placeholders::_2;
 
         if (this->declare_parameter("use_odom_guess", false)) {
-            guess_sub.subscribe(this, "odom_guess", rclcpp::SensorDataQoS().get_rmw_qos_profile());
+            guess_sub.subscribe(this, "odom_guess", sensor_qos.get_rmw_qos_profile());
             sync = std::make_shared<message_filters::Synchronizer<sync_policy>>(sync_policy(30),
                 scan_sub, guess_sub);
-            sync->setAgePenalty(0.5);
+            sync->setAgePenalty(0.0);
             sync->registerCallback(std::bind(&LidarOdometry::scan_guess_callback, this, _1, _2));
+            RCLCPP_INFO(this->get_logger(), "Using odometry guess");
         } else {
             scan_sub.registerCallback(std::bind(&LidarOdometry::scan_only_callback, this, _1));
+            RCLCPP_INFO(this->get_logger(), "Not using odometry guess");
         }
 
         if (this->declare_parameter("show_debug_scans", false)) {
@@ -49,14 +52,20 @@ public:
                 "current_scan", rclcpp::QoS(1));
 
             debug_publishers = publishers;
+            RCLCPP_INFO(this->get_logger(), "Publishing debug messages");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Not publishing debug scans");
         }
 
         if (this->declare_parameter("publish_tf", false)) {
             tf = tf2_ros::TransformBroadcaster(this);
+            RCLCPP_INFO(this->get_logger(), "Publishing TF");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Not publishing TF");
         }
 
-        this->declare_parameter("rebase_translation_min_m", 0.05);        // 5 cm
-        this->declare_parameter("rebase_angle_min_rad", 2 * M_PI / 180);  // 2 deg
+        this->declare_parameter("rebase_translation_min_m", 0.05);  // 5 cm
+        this->declare_parameter("rebase_angle_min_deg", 2.0);       // 2 deg
         this->declare_parameter("rebase_time_min_ms", 1000);
     }
 
@@ -71,7 +80,7 @@ private:
     };
 
     struct BaseScanInfo {
-        sensor_msgs::msg::LaserScan::SharedPtr base_scan;
+        sensor_msgs::msg::LaserScan::ConstSharedPtr base_scan;
         std::vector<icp::Vector> points;
         std::optional<nav_msgs::msg::Odometry> previous_guess;
     };
@@ -96,16 +105,16 @@ private:
         return driver;
     }
 
-    void scan_only_callback(const sensor_msgs::msg::LaserScan::SharedPtr scan) {
+    void scan_only_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan) {
         update_odometry(scan, {});
     }
 
-    void scan_guess_callback(const sensor_msgs::msg::LaserScan::SharedPtr scan,
-        const nav_msgs::msg::Odometry::SharedPtr guess) {
+    void scan_guess_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan,
+        const nav_msgs::msg::Odometry::ConstSharedPtr& guess) {
         update_odometry(scan, *guess);
     }
 
-    void update_odometry(const sensor_msgs::msg::LaserScan::SharedPtr scan,
+    void update_odometry(const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan,
         std::optional<nav_msgs::msg::Odometry> guess) {
         auto points = get_points(scan);
 
@@ -139,7 +148,7 @@ private:
             Eigen::Matrix2d prev_2d = prev_mat.topLeftCorner<2, 2>();
 
             init.rotation = guess_2d * prev_2d.transpose();
-            init.translation = guess_t - init.rotation * prev_t;
+            init.translation = guess_t.head<2>() - init.rotation * prev_t.head<2>();
         }
 
         auto result = driver.converge(points, base_info->points, init);
@@ -172,12 +181,13 @@ private:
         rclcpp::Time last_scan_time(base_info->base_scan->header.stamp);
         auto rebase_ms =
             std::chrono::milliseconds(this->get_parameter("rebase_time_min_ms").as_int());
+        double rebase_angle_rad = this->get_parameter("rebase_angle_min_deg").as_double() * M_PI
+                                  / 180;
+        double rebase_dist_m = this->get_parameter("rebase_translation_min_m").as_double();
 
         bool conditions[3] = {
-            result.transform.translation.norm()
-                > this->get_parameter("rebase_translation_min_m").as_double(),
-            std::abs(result_rot.smallestAngle())
-                > this->get_parameter("rebase_angle_min_rad").as_double(),
+            result.transform.translation.norm() > rebase_dist_m,
+            std::abs(result_rot.smallestAngle()) > rebase_angle_rad,
             this->get_clock()->now() - last_scan_time > rclcpp::Duration(rebase_ms),
         };
 
@@ -227,7 +237,7 @@ private:
         }
     }
 
-    std::vector<icp::Vector> get_points(const sensor_msgs::msg::LaserScan::SharedPtr scan) {
+    std::vector<icp::Vector> get_points(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan) {
         std::vector<icp::Vector> points;
         for (std::size_t i = 0; i < scan->ranges.size(); i++) {
             auto range = scan->ranges[i];
