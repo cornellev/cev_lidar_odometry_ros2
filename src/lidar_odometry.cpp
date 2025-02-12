@@ -11,6 +11,9 @@
 #include "tf2_eigen/tf2_eigen.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
+#include "message_filters/time_synchronizer.h"
+#include "message_filters/subscriber.h"
+#include "message_filters/sync_policies/approximate_time.h"
 #include <chrono>
 
 class LidarOdometry : public rclcpp::Node {
@@ -18,14 +21,24 @@ public:
     LidarOdometry(): Node("lidar_odometry"), driver(driver_init()) {
         this->declare_parameter("odom_frame", "odom");
 
-        scan_sub = this->create_subscription<sensor_msgs::msg::LaserScan>("scan",
-            rclcpp::SensorDataQoS(),
-            std::bind(&LidarOdometry::scan_callback, this, std::placeholders::_1));
-
         odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("odom", rclcpp::QoS(1));
 
-        // TODO: make false
-        if (this->declare_parameter("show_debug_scans", true)) {
+        scan_sub.subscribe(this, "scan", rclcpp::SensorDataQoS().get_rmw_qos_profile());
+
+        using std::placeholders::_1;
+        using std::placeholders::_2;
+
+        if (this->declare_parameter("use_odom_guess", false)) {
+            guess_sub.subscribe(this, "odom_guess", rclcpp::SensorDataQoS().get_rmw_qos_profile());
+            sync = std::make_shared<message_filters::Synchronizer<sync_policy>>(sync_policy(30),
+                scan_sub, guess_sub);
+            sync->setAgePenalty(0.5);
+            sync->registerCallback(std::bind(&LidarOdometry::scan_guess_callback, this, _1, _2));
+        } else {
+            scan_sub.registerCallback(std::bind(&LidarOdometry::scan_only_callback, this, _1));
+        }
+
+        if (this->declare_parameter("show_debug_scans", false)) {
             DebugPublishers publishers;
 
             publishers.base_scan =
@@ -38,8 +51,7 @@ public:
             debug_publishers = publishers;
         }
 
-        // TODO: make false
-        if (this->declare_parameter("publish_tf", true)) {
+        if (this->declare_parameter("publish_tf", false)) {
             tf = tf2_ros::TransformBroadcaster(this);
         }
 
@@ -49,6 +61,9 @@ public:
     }
 
 private:
+    using sync_policy = message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::LaserScan,
+        nav_msgs::msg::Odometry>;
+
     struct DebugPublishers {
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr base_scan;
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr current_scan;
@@ -58,10 +73,11 @@ private:
     struct BaseScanInfo {
         sensor_msgs::msg::LaserScan::SharedPtr base_scan;
         std::vector<icp::Vector> points;
+        std::optional<nav_msgs::msg::Odometry> previous_guess;
     };
 
     icp::ICPDriver driver_init() {
-        auto method = this->declare_parameter("icp_method", "feature_aware");
+        auto method = this->declare_parameter("icp_method", "trimmed");
 
         // TODO: load from params
         icp::ICP::Config config;
@@ -80,19 +96,53 @@ private:
         return driver;
     }
 
-    void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr scan) {
+    void scan_only_callback(const sensor_msgs::msg::LaserScan::SharedPtr scan) {
+        update_odometry(scan, {});
+    }
+
+    void scan_guess_callback(const sensor_msgs::msg::LaserScan::SharedPtr scan,
+        const nav_msgs::msg::Odometry::SharedPtr guess) {
+        update_odometry(scan, *guess);
+    }
+
+    void update_odometry(const sensor_msgs::msg::LaserScan::SharedPtr scan,
+        std::optional<nav_msgs::msg::Odometry> guess) {
         auto points = get_points(scan);
 
         if (!base_info.has_value()) {
             BaseScanInfo info;
             info.base_scan = scan;
             info.points = points;
+            info.previous_guess = guess;
 
             base_info = info;
             return;
         }
 
-        auto result = driver.converge(points, base_info->points, icp::RBTransform());
+        icp::RBTransform init;
+        if (guess && base_info->previous_guess) {
+            Eigen::Quaterniond guess_q;
+            Eigen::Vector3d guess_t;
+            tf2::fromMsg(guess->pose.pose.orientation, guess_q);
+            tf2::fromMsg(guess->pose.pose.position, guess_t);
+
+            Eigen::Quaterniond prev_q;
+            Eigen::Vector3d prev_t;
+            tf2::fromMsg(base_info->previous_guess->pose.pose.orientation, prev_q);
+            tf2::fromMsg(base_info->previous_guess->pose.pose.position, prev_t);
+
+            Eigen::Matrix3d guess_mat = guess_q.toRotationMatrix();
+            Eigen::Matrix3d prev_mat = prev_q.toRotationMatrix();
+
+            // we only care about planar rotation
+            Eigen::Matrix2d guess_2d = guess_mat.topLeftCorner<2, 2>();
+            Eigen::Matrix2d prev_2d = prev_mat.topLeftCorner<2, 2>();
+
+            init.rotation = guess_2d * prev_2d.transpose();
+            init.translation = guess_t - init.rotation * prev_t;
+        }
+
+        auto result = driver.converge(points, base_info->points, init);
 
         Eigen::Rotation2Dd result_rot(result.transform.rotation);
         RCLCPP_DEBUG(this->get_logger(), "dx: %f, dy: %f, dtheta: %f, iterations: %zu",
@@ -131,11 +181,12 @@ private:
             this->get_clock()->now() - last_scan_time > rclcpp::Duration(rebase_ms),
         };
 
-        if (conditions[0] || conditions[1]) {
+        if (conditions[0] || conditions[1] || conditions[2]) {
             current_transform = current_transform.and_then(result.transform);
 
             base_info->base_scan = scan;
             base_info->points = points;
+            base_info->previous_guess = guess;
 
             RCLCPP_DEBUG(this->get_logger(),
                 "Rebasing scan. Reasons: translation: %d, rotation: %d, time: %d", conditions[0],
@@ -229,7 +280,9 @@ private:
     icp::RBTransform current_transform;
     std::optional<BaseScanInfo> base_info;
 
-    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub;
+    message_filters::Subscriber<sensor_msgs::msg::LaserScan> scan_sub;
+    message_filters::Subscriber<nav_msgs::msg::Odometry> guess_sub;
+    std::shared_ptr<message_filters::Synchronizer<sync_policy>> sync;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
 
     std::optional<DebugPublishers> debug_publishers;
