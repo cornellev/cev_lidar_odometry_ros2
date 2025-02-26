@@ -17,7 +17,7 @@ def generate_launch_description():
                         "odom_frame": "odom",
                         "use_odom_guess": True,
                         "show_debug_scans": True,
-                        "publish_tf": True,
+                        "publish_tf": False,
                         "rebase_translation_min_m": 0.05,
                         "rebase_angle_min_deg": 2.0,
                         "rebase_time_min_ms": 1000,

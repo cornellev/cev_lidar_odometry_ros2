@@ -21,20 +21,20 @@
 class LidarOdometry : public rclcpp::Node {
 public:
     LidarOdometry(): Node("lidar_odometry"), driver(driver_init()) {
-        odom_frame = this->declare_parameter("odom_frame", "odom");
+        odom_frame = declare_parameter("odom_frame", "odom");
 
-        odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("odom", rclcpp::QoS(1));
+        odom_pub = create_publisher<nav_msgs::msg::Odometry>("odom", rclcpp::QoS(1));
 
         auto sensor_qos = rclcpp::SensorDataQoS();
         scan_sub.subscribe(this, "scan", sensor_qos.get_rmw_qos_profile());
 
-        tf_buffer = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        tf_buffer = std::make_unique<tf2_ros::Buffer>(get_clock());
         tf_listen = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
 
         using std::placeholders::_1;
         using std::placeholders::_2;
 
-        if (this->declare_parameter("use_odom_guess", false)) {
+        if (declare_parameter("use_odom_guess", false)) {
             guess_sub.subscribe(this, "odom_guess", sensor_qos.get_rmw_qos_profile());
             sync = std::make_shared<message_filters::Synchronizer<sync_policy>>(sync_policy(30),
                 scan_sub, guess_sub);
@@ -43,41 +43,41 @@ public:
 
             transform_is_initialized = false;
 
-            RCLCPP_INFO(this->get_logger(), "Using odometry guess");
+            RCLCPP_INFO(get_logger(), "Using odometry guess");
         } else {
             scan_sub.registerCallback(std::bind(&LidarOdometry::scan_only_callback, this, _1));
 
             transform_is_initialized = true;
 
-            RCLCPP_INFO(this->get_logger(), "Not using odometry guess");
+            RCLCPP_INFO(get_logger(), "Not using odometry guess");
         }
 
-        if (this->declare_parameter("show_debug_scans", false)) {
+        if (declare_parameter("show_debug_scans", false)) {
             DebugPublishers publishers;
 
-            publishers.base_scan =
-                this->create_publisher<sensor_msgs::msg::PointCloud2>("base_scan", rclcpp::QoS(1));
-            publishers.transformed_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-                "transformed_scan", rclcpp::QoS(1));
-            publishers.current_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-                "current_scan", rclcpp::QoS(1));
+            publishers.base_scan = create_publisher<sensor_msgs::msg::PointCloud2>("base_scan",
+                rclcpp::QoS(1));
+            publishers.transformed_scan =
+                create_publisher<sensor_msgs::msg::PointCloud2>("transformed_scan", rclcpp::QoS(1));
+            publishers.current_scan =
+                create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(1));
 
             debug_publishers = publishers;
-            RCLCPP_INFO(this->get_logger(), "Publishing debug messages");
+            RCLCPP_INFO(get_logger(), "Publishing debug messages");
         } else {
-            RCLCPP_INFO(this->get_logger(), "Not publishing debug scans");
+            RCLCPP_INFO(get_logger(), "Not publishing debug scans");
         }
 
-        if (this->declare_parameter("publish_tf", false)) {
+        if (declare_parameter("publish_tf", false)) {
             tf_broadcast = tf2_ros::TransformBroadcaster(this);
-            RCLCPP_INFO(this->get_logger(), "Publishing TF");
+            RCLCPP_INFO(get_logger(), "Publishing TF");
         } else {
-            RCLCPP_INFO(this->get_logger(), "Not publishing TF");
+            RCLCPP_INFO(get_logger(), "Not publishing TF");
         }
 
-        this->declare_parameter("rebase_translation_min_m", 0.05);  // 5 cm
-        this->declare_parameter("rebase_angle_min_deg", 2.0);       // 2 deg
-        this->declare_parameter("rebase_time_min_ms", 1000);
+        declare_parameter("rebase_translation_min_m", 0.05);  // 5 cm
+        declare_parameter("rebase_angle_min_deg", 2.0);       // 2 deg
+        declare_parameter("rebase_time_min_ms", 1000);
     }
 
 private:
@@ -97,7 +97,7 @@ private:
     };
 
     icp::ICPDriver driver_init() {
-        auto method = this->declare_parameter("icp_method", "trimmed");
+        auto method = declare_parameter("icp_method", "trimmed");
 
         // TODO: load from params
         icp::ICP::Config config;
@@ -150,6 +150,7 @@ private:
                 current_transform.rotation = odom_eigen.rotation().topLeftCorner<2, 2>();
                 current_transform.translation = odom_eigen.translation().head<2>();
                 transform_is_initialized = true;
+                RCLCPP_INFO(get_logger(), "Initialized odometry from external odometry.");
             } else {
                 return;
             }
@@ -161,7 +162,6 @@ private:
             assert(base_info->odom_guess.has_value());
             assert(odom_guess->header.frame_id == odom_frame);
             assert(base_info->odom_guess->header.frame_id == odom_frame);
-            assert(base_info->odom_guess->child_frame_id == scan->header.frame_id);
 
             // TODO: for now i'm just transforming both, we may consider storing the transformed
             // version?
@@ -170,29 +170,35 @@ private:
             auto current_laser_frame_odom = transform_odom(*odom_guess, scan->header.frame_id);
 
             if (last_laser_frame_odom && current_laser_frame_odom) {
-                Eigen::Isometry3d laser_odom_eigen;
-                tf2::fromMsg(current_laser_frame_odom->pose.pose, laser_odom_eigen);
+                Eigen::Isometry3d current_guess_eigen;
+                tf2::fromMsg(current_laser_frame_odom->pose.pose, current_guess_eigen);
 
                 Eigen::Isometry3d previous_guess_eigen;
                 tf2::fromMsg(last_laser_frame_odom->pose.pose, previous_guess_eigen);
 
-                Eigen::Isometry3d diff = previous_guess_eigen * laser_odom_eigen.inverse();
+                // T_d T_p v = T_c v
+                // T_d T_p = T_c
+                // T_d = T_c T_p^-1
+
+                Eigen::Isometry3d diff =
+                    (current_guess_eigen.inverse() * previous_guess_eigen).inverse();
                 initial_match_guess.rotation = diff.rotation().topLeftCorner<2, 2>();
                 initial_match_guess.translation = diff.translation().head<2>();
             }
         }
 
         // compute transform using initial guess (if available, otherwise identity)
-        auto result = driver.converge(points, base_info->points, initial_match_guess);
+        auto result = driver.converge(base_info->points, points, initial_match_guess);
+        auto car_transform = result.transform.inverse();
 
-        Eigen::Rotation2Dd result_rot(result.transform.rotation);
-        RCLCPP_DEBUG(this->get_logger(), "dx: %f, dy: %f, dtheta: %f, iterations: %zu",
-            result.transform.translation.x(), result.transform.translation.y(), result_rot.angle(),
+        Eigen::Rotation2Dd result_rot(car_transform.rotation);
+        RCLCPP_DEBUG(get_logger(), "dx: %f, dy: %f, dtheta: %f, iterations: %zu",
+            car_transform.translation.x(), car_transform.translation.y(), result_rot.angle(),
             result.iteration_count);
 
         // publish debug scans (important that this happens before we update base scans)
         if (debug_publishers.has_value()) {
-            auto point_transform = result.transform.inverse();
+            auto point_transform = car_transform.inverse();
 
             debug_publishers->base_scan->publish(create_pointcloud(base_info->points,
                 base_info->base_scan->header));
@@ -211,34 +217,31 @@ private:
 
         // update base scan if any condition is satisfied
         rclcpp::Time last_scan_time(base_info->base_scan->header.stamp);
-        auto rebase_ms =
-            std::chrono::milliseconds(this->get_parameter("rebase_time_min_ms").as_int());
-        double rebase_angle_rad = this->get_parameter("rebase_angle_min_deg").as_double() * M_PI
-                                  / 180;
-        double rebase_dist_m = this->get_parameter("rebase_translation_min_m").as_double();
+        auto rebase_ms = std::chrono::milliseconds(get_parameter("rebase_time_min_ms").as_int());
+        double rebase_angle_rad = get_parameter("rebase_angle_min_deg").as_double() * M_PI / 180;
+        double rebase_dist_m = get_parameter("rebase_translation_min_m").as_double();
 
         bool conditions[3] = {
-            result.transform.translation.norm() > rebase_dist_m,
+            car_transform.translation.norm() > rebase_dist_m,
             std::abs(result_rot.smallestAngle()) > rebase_angle_rad,
-            this->get_clock()->now() - last_scan_time > rclcpp::Duration(rebase_ms),
+            get_clock()->now() - last_scan_time > rclcpp::Duration(rebase_ms),
         };
 
         if (conditions[0] || conditions[1] || conditions[2]) {
-            current_transform = current_transform.and_then(result.transform);
+            current_transform = current_transform.and_then(car_transform);
 
             base_info->base_scan = scan;
             base_info->points = points;
             base_info->odom_guess = odom_guess;
 
-            RCLCPP_DEBUG(this->get_logger(),
+            RCLCPP_DEBUG(get_logger(),
                 "Rebasing scan. Reasons: translation: %d, rotation: %d, time: %d", conditions[0],
                 conditions[1], conditions[2]);
         }
 
         Eigen::Rotation2Dd final_rot(current_transform.rotation);
-        RCLCPP_DEBUG(this->get_logger(), "x: %f, y: %f, theta: %f",
-            current_transform.translation.x(), current_transform.translation.y(),
-            final_rot.smallestAngle());
+        RCLCPP_DEBUG(get_logger(), "x: %f, y: %f, theta: %f", current_transform.translation.x(),
+            current_transform.translation.y(), final_rot.smallestAngle());
 
         // publish odometry
         nav_msgs::msg::Odometry odom;
@@ -252,6 +255,10 @@ private:
         Eigen::AngleAxisd angle_axis(final_rot.smallestAngle(), Eigen::Vector3d::UnitZ());
         Eigen::Quaterniond quat(angle_axis);
         odom.pose.pose.orientation = tf2::toMsg(quat);
+
+        // TEMP
+        // auto transformed_guess = transform_odom(*odom_guess, scan->header.frame_id);
+        // odom = transformed_guess.value();
 
         odom_pub->publish(odom);
 
@@ -336,11 +343,24 @@ private:
         }
 
         Eigen::Isometry3d odom_child_to_target = tf2::transformToEigen(odom_child_to_target_tf);
-        Eigen::Isometry3d odom_to_child;
-        tf2::fromMsg(odom.pose.pose, odom_to_child);
+        Eigen::Isometry3d odom_to_odom_child;
+        tf2::fromMsg(odom.pose.pose, odom_to_odom_child);
+        odom_to_odom_child = odom_to_odom_child.inverse();
 
-        Eigen::Isometry3d odom_to_target = odom_child_to_target * odom_to_child;
-        geometry_msgs::msg::Pose target_pose_odom_frame = tf2::toMsg(odom_to_target);
+        RCLCPP_DEBUG(get_logger(), "%f %f %f %f -- %f %f %f %f",
+            odom_child_to_target.translation().x(), odom_child_to_target.translation().y(),
+            odom_child_to_target.translation().z(),
+            odom_child_to_target.rotation().eulerAngles(0, 1, 2)[2],
+            odom_to_odom_child.translation().x(), odom_to_odom_child.translation().y(),
+            odom_to_odom_child.translation().z(),
+            odom_to_odom_child.rotation().eulerAngles(0, 1, 2)[2]);
+
+        Eigen::Isometry3d odom_to_target = odom_child_to_target * odom_to_odom_child;
+        RCLCPP_DEBUG(get_logger(), "%f %f %f %f", odom_to_target.translation().x(),
+            odom_to_target.translation().y(), odom_to_target.translation().z(),
+            odom_to_target.rotation().eulerAngles(0, 1, 2)[2]);
+
+        geometry_msgs::msg::Pose target_pose_odom_frame = tf2::toMsg(odom_to_target.inverse());
 
         Eigen::Vector3d lin_vel;
         Eigen::Vector3d ang_vel;
