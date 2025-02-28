@@ -170,20 +170,23 @@ private:
             auto current_laser_frame_odom = transform_odom(*odom_guess, scan->header.frame_id);
 
             if (last_laser_frame_odom && current_laser_frame_odom) {
+                // T_c(p) gives a point in the current laser frame in the odom frame
                 Eigen::Isometry3d current_guess_eigen;
                 tf2::fromMsg(current_laser_frame_odom->pose.pose, current_guess_eigen);
 
+                // T_p(p) gives a point in the past laser frame in the odom frame
                 Eigen::Isometry3d previous_guess_eigen;
                 tf2::fromMsg(last_laser_frame_odom->pose.pose, previous_guess_eigen);
 
-                // T_d T_p v = T_c v
-                // T_d T_p = T_c
-                // T_d = T_c T_p^-1
+                // Want: T_d(p) that gives a point in the past laser frame in the current laser
+                // frame. Actually, we will want T_d^-1 for the initial guess.
+                //
+                // T_d(T_p(p)) = T_c(p)
+                // T_d = T_c * T_p^-1
+                Eigen::Isometry3d diff = current_guess_eigen * previous_guess_eigen.inverse();
 
-                Eigen::Isometry3d diff =
-                    (current_guess_eigen.inverse() * previous_guess_eigen).inverse();
-                initial_match_guess.rotation = diff.rotation().topLeftCorner<2, 2>();
-                initial_match_guess.translation = diff.translation().head<2>();
+                initial_match_guess.rotation = diff.inverse().rotation().topLeftCorner<2, 2>();
+                initial_match_guess.translation = diff.inverse().translation().head<2>();
             }
         }
 
@@ -239,6 +242,7 @@ private:
                 conditions[1], conditions[2]);
         }
 
+        // TODO: incorporate the transform we just got even if we don't rebase
         Eigen::Rotation2Dd final_rot(current_transform.rotation);
         RCLCPP_DEBUG(get_logger(), "x: %f, y: %f, theta: %f", current_transform.translation.x(),
             current_transform.translation.y(), final_rot.smallestAngle());
