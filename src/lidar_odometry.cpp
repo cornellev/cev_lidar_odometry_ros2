@@ -78,6 +78,8 @@ public:
         declare_parameter("rebase_translation_min_m", 0.05);  // 5 cm
         declare_parameter("rebase_angle_min_deg", 2.0);       // 2 deg
         declare_parameter("rebase_time_min_ms", 1000);
+
+        RCLCPP_INFO(get_logger(), "LiDAR odometry node initialized");
     }
 
 private:
@@ -136,6 +138,8 @@ private:
             info.points = points;
             info.odom_guess = odom_guess;
             base_info = info;
+            RCLCPP_INFO(get_logger(), "Receiving scans");
+
             return;
         }
 
@@ -147,10 +151,10 @@ private:
             if (transformed_guess) {
                 Eigen::Isometry3d odom_eigen;
                 tf2::fromMsg(transformed_guess->pose.pose, odom_eigen);
-                current_transform.rotation = odom_eigen.rotation().topLeftCorner<2, 2>();
-                current_transform.translation = odom_eigen.translation().head<2>();
+                current_pose.rotation = odom_eigen.rotation().topLeftCorner<2, 2>();
+                current_pose.translation = odom_eigen.translation().head<2>();
                 transform_is_initialized = true;
-                RCLCPP_INFO(get_logger(), "Initialized odometry from external odometry.");
+                RCLCPP_INFO(get_logger(), "Initialized odometry from external odometry");
             } else {
                 return;
             }
@@ -171,33 +175,28 @@ private:
 
             if (last_laser_frame_odom && current_laser_frame_odom) {
                 // T_c(p) gives a point in the current laser frame in the odom frame
-                Eigen::Isometry3d current_guess_eigen;
-                tf2::fromMsg(current_laser_frame_odom->pose.pose, current_guess_eigen);
+                Eigen::Isometry3d current_guess_pose;
+                tf2::fromMsg(current_laser_frame_odom->pose.pose, current_guess_pose);
 
                 // T_p(p) gives a point in the past laser frame in the odom frame
-                Eigen::Isometry3d previous_guess_eigen;
-                tf2::fromMsg(last_laser_frame_odom->pose.pose, previous_guess_eigen);
+                Eigen::Isometry3d previous_guess_pose;
+                tf2::fromMsg(last_laser_frame_odom->pose.pose, previous_guess_pose);
 
                 // Want: T_d(p) that gives a point in the past laser frame in the current laser
                 // frame. Actually, we will want T_d^-1 for the initial guess.
                 //
-                // T_d(T_p(p)) = T_c(p)
-                // T_d = T_c * T_p^-1
-                Eigen::Isometry3d diff = current_guess_eigen * previous_guess_eigen.inverse();
+                // T_d T_p^-1 = T_c^-1
+                // T_d = T_c^-1 T_p
+                // T_d^-1 = T_p^-1 T_c
+                Eigen::Isometry3d diff_inv = previous_guess_pose.inverse() * current_guess_pose;
 
-                initial_match_guess.rotation = diff.inverse().rotation().topLeftCorner<2, 2>();
-                initial_match_guess.translation = diff.inverse().translation().head<2>();
+                initial_match_guess.rotation = diff_inv.rotation().topLeftCorner<2, 2>();
+                initial_match_guess.translation = diff_inv.translation().head<2>();
             }
         }
 
         // compute transform using initial guess (if available, otherwise identity)
         auto result = driver.converge(base_info->points, points, initial_match_guess);
-        icp::RBTransform car_delta_transform = result.transform.inverse();
-
-        Eigen::Rotation2Dd car_delta_rot(car_delta_transform.rotation);
-        RCLCPP_DEBUG(get_logger(), "dx: %f, dy: %f, dtheta: %f, iterations: %zu",
-            car_delta_transform.translation.x(), car_delta_transform.translation.y(),
-            car_delta_rot.angle(), result.iteration_count);
 
         // publish debug scans (important that this happens before we update base scans)
         if (debug_publishers.has_value()) {
@@ -218,8 +217,17 @@ private:
             debug_publishers->current_scan->publish(current_cloud);
         }
 
-        // compute new transform
-        icp::RBTransform new_transform = car_delta_transform.and_then(current_transform);
+        // icp::RBTransform car_delta_pose = result.transform.inverse();
+        icp::RBTransform car_delta_pose = initial_match_guess.inverse();
+
+        Eigen::Rotation2Dd car_delta_rot(car_delta_pose.rotation);
+        RCLCPP_DEBUG(get_logger(), "dx: %f, dy: %f, dtheta: %f, iterations: %zu",
+            car_delta_pose.translation.x(), car_delta_pose.translation.y(), car_delta_rot.angle(),
+            result.iteration_count);
+
+        // compute new transform.
+        // we multiply in reverse order because we are essentially composing poses, not transforms
+        icp::RBTransform new_pose = car_delta_pose.and_then(current_pose);
 
         // update base scan if any condition is satisfied
         rclcpp::Time last_scan_time(base_info->base_scan->header.stamp);
@@ -228,13 +236,13 @@ private:
         double rebase_dist_m = get_parameter("rebase_translation_min_m").as_double();
 
         bool conditions[3] = {
-            car_delta_transform.translation.norm() > rebase_dist_m,
+            car_delta_pose.translation.norm() > rebase_dist_m,
             std::abs(car_delta_rot.smallestAngle()) > rebase_angle_rad,
             get_clock()->now() - last_scan_time > rclcpp::Duration(rebase_ms),
         };
 
         if (conditions[0] || conditions[1] || conditions[2]) {
-            current_transform = new_transform;
+            current_pose = new_pose;
 
             base_info->base_scan = scan;
             base_info->points = points;
@@ -245,9 +253,9 @@ private:
                 conditions[1], conditions[2]);
         }
 
-        Eigen::Rotation2Dd new_rot(new_transform.rotation);
-        RCLCPP_DEBUG(get_logger(), "x: %f, y: %f, theta: %f", new_transform.translation.x(),
-            new_transform.translation.y(), new_rot.smallestAngle());
+        Eigen::Rotation2Dd new_rot(new_pose.rotation);
+        RCLCPP_DEBUG(get_logger(), "x: %f, y: %f, theta: %f", new_pose.translation.x(),
+            new_pose.translation.y(), new_rot.smallestAngle());
 
         // publish odometry
         nav_msgs::msg::Odometry odom;
@@ -255,8 +263,8 @@ private:
         odom.header.frame_id = odom_frame;
         odom.child_frame_id = scan->header.frame_id;
 
-        odom.pose.pose.position = tf2::toMsg(Eigen::Vector3d(new_transform.translation.x(),
-            new_transform.translation.y(), 0));
+        odom.pose.pose.position = tf2::toMsg(Eigen::Vector3d(new_pose.translation.x(),
+            new_pose.translation.y(), 0));
 
         Eigen::AngleAxisd angle_axis(new_rot.smallestAngle(), Eigen::Vector3d::UnitZ());
         Eigen::Quaterniond quat(angle_axis);
@@ -329,39 +337,28 @@ private:
 
     std::optional<nav_msgs::msg::Odometry> transform_odom(const nav_msgs::msg::Odometry& odom,
         const std::string& target_frame) {
-        // auto odom_child_to_target_tf = tf_buffer->lookupTransform(target_frame,
-        // odom.child_frame_id,
-        //     odom.header.stamp);
-        // TODO: use above, doing this because clocks are not synced between computer and robot
-
         geometry_msgs::msg::TransformStamped odom_child_to_target_tf;
         try {
             odom_child_to_target_tf = tf_buffer->lookupTransform(target_frame, odom.child_frame_id,
-                tf2::TimePointZero);
+                odom.header.stamp);
             // TODO: should we catch other tf exceptions as well? which ones do we need to catch
         } catch (const tf2::ConnectivityException& _) {
             // data is likely not in buffer yet, lookup failed
             return {};
+        } catch (const tf2::LookupException& _) {
+            return {};
         }
 
         Eigen::Isometry3d odom_child_to_target = tf2::transformToEigen(odom_child_to_target_tf);
+
         Eigen::Isometry3d odom_to_odom_child;
         tf2::fromMsg(odom.pose.pose, odom_to_odom_child);
+        // pose is the inverse of the transform from odom to odom child
         odom_to_odom_child = odom_to_odom_child.inverse();
 
-        RCLCPP_DEBUG(get_logger(), "%f %f %f %f -- %f %f %f %f",
-            odom_child_to_target.translation().x(), odom_child_to_target.translation().y(),
-            odom_child_to_target.translation().z(),
-            odom_child_to_target.rotation().eulerAngles(0, 1, 2)[2],
-            odom_to_odom_child.translation().x(), odom_to_odom_child.translation().y(),
-            odom_to_odom_child.translation().z(),
-            odom_to_odom_child.rotation().eulerAngles(0, 1, 2)[2]);
-
         Eigen::Isometry3d odom_to_target = odom_child_to_target * odom_to_odom_child;
-        RCLCPP_DEBUG(get_logger(), "%f %f %f %f", odom_to_target.translation().x(),
-            odom_to_target.translation().y(), odom_to_target.translation().z(),
-            odom_to_target.rotation().eulerAngles(0, 1, 2)[2]);
 
+        // pose is the inverse of the transform from odom to target
         geometry_msgs::msg::Pose target_pose_odom_frame = tf2::toMsg(odom_to_target.inverse());
 
         Eigen::Vector3d lin_vel;
@@ -384,7 +381,7 @@ private:
 
     icp::ICPDriver driver;
     bool transform_is_initialized;
-    icp::RBTransform current_transform;
+    icp::RBTransform current_pose;
     std::optional<BaseScanInfo> base_info;
 
     message_filters::Subscriber<sensor_msgs::msg::LaserScan> scan_sub;

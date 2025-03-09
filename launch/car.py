@@ -24,7 +24,6 @@ def generate_launch_description():
                     }
                 ],
                 remappings=[("odom_guess", "/odometry/filtered")],
-                arguments=["--ros-args", "--log-level", "debug"],
             ),
         ]
     )
