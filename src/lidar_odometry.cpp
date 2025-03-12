@@ -174,24 +174,23 @@ private:
             auto current_laser_frame_odom = transform_odom(*odom_guess, scan->header.frame_id);
 
             if (last_laser_frame_odom && current_laser_frame_odom) {
-                // T_c(p) gives a point in the current laser frame in the odom frame
+                // P_c takes a point relative to the current pose and gives it in the odom frame
                 Eigen::Isometry3d current_guess_pose;
                 tf2::fromMsg(current_laser_frame_odom->pose.pose, current_guess_pose);
 
-                // T_p(p) gives a point in the past laser frame in the odom frame
+                // P_p takes a point relative to the last pose and gives it in the odom frame
                 Eigen::Isometry3d previous_guess_pose;
                 tf2::fromMsg(last_laser_frame_odom->pose.pose, previous_guess_pose);
 
-                // Want: T_d(p) that gives a point in the past laser frame in the current laser
-                // frame. Actually, we will want T_d^-1 for the initial guess.
-                //
-                // T_d T_p^-1 = T_c^-1
-                // T_d = T_c^-1 T_p
-                // T_d^-1 = T_p^-1 T_c
-                Eigen::Isometry3d diff_inv = previous_guess_pose.inverse() * current_guess_pose;
+                // Need inverse of the pose difference
+                // How do we get the pose difference?
+                // Want P_d that takes a point relative to the current pose and gives it relative to
+                // the last pose
+                // P_d P_c^-1 = P_p^-1
+                Eigen::Isometry3d pose_diff = previous_guess_pose.inverse() * current_guess_pose;
 
-                initial_match_guess.rotation = diff_inv.rotation().topLeftCorner<2, 2>();
-                initial_match_guess.translation = diff_inv.translation().head<2>();
+                initial_match_guess.rotation = pose_diff.inverse().rotation().topLeftCorner<2, 2>();
+                initial_match_guess.translation = pose_diff.inverse().translation().head<2>();
             }
         }
 
@@ -217,8 +216,7 @@ private:
             debug_publishers->current_scan->publish(current_cloud);
         }
 
-        // icp::RBTransform car_delta_pose = result.transform.inverse();
-        icp::RBTransform car_delta_pose = initial_match_guess.inverse();
+        icp::RBTransform car_delta_pose = result.transform.inverse();
 
         Eigen::Rotation2Dd car_delta_rot(car_delta_pose.rotation);
         RCLCPP_DEBUG(get_logger(), "dx: %f, dy: %f, dtheta: %f, iterations: %zu",
